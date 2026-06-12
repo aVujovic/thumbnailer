@@ -514,7 +514,6 @@ readable error). See [.env.example](./.env.example) for the full list. Most-used
 | `OUTPUT_ROOT` | generator | Where thumbnails are written (`OUTPUT_ROOT/<tenantId>/`, mirror-tree) |
 | `VIDEO_DB_PATH` | generator, sync | Shared video DB (JSONL) path (default repo-root `videoDb.jsonl`) |
 | `THUMBNAIL_FORMAT` | generator | Output image format (`jpg`, `png`, …) |
-| `GENERATE_CONCURRENCY` | generator | Max concurrent ffmpeg processes |
 | `GENERATE_TIMEOUT_MS` | generator | Per-job timeout before the process is killed |
 | `GENERATE_MAX_RETRIES` | generator | Retries on failure (total attempts = retries + 1) |
 | `GENERATE_FORCE` | generator | Regenerate even if a thumbnail already exists |

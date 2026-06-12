@@ -24,7 +24,6 @@ export const ConfigSchema = z
     VIDEO_DB_PATH: z.string().min(1).default('../../videoDb.jsonl'),
     TOPIC_THUMBNAIL_READY: z.string().min(1).default('thumbnail-ready'),
 
-    GENERATE_CONCURRENCY: z.coerce.number().int().positive().default(4),
     GENERATE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
     GENERATE_MAX_RETRIES: z.coerce.number().int().nonnegative().default(2),
     GENERATE_FORCE: booleanish.default('false'),
@@ -59,7 +58,6 @@ export const ConfigSchema = z
     readyTopic: env.TOPIC_THUMBNAIL_READY,
 
     // generation behaviour
-    concurrency: env.GENERATE_CONCURRENCY,
     timeoutMs: env.GENERATE_TIMEOUT_MS,
     maxRetries: env.GENERATE_MAX_RETRIES,
     force: env.GENERATE_FORCE,
