@@ -1,0 +1,80 @@
+name: CI
+
+# Run on every push to main and on PRs targeting main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: tests ───────────────────────────────────────────────
+  # Type-checks every package and runs the full unit-test suite. All tests
+  # use in-memory fakes (no Kafka/ffmpeg/disk), so no services are needed.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm type-check
+
+      - name: Run tests
+        run: pnpm test
+
+  # ── Job 2: deploy simulation ───────────────────────────────────
+  # Depends on `test`, so it only runs when the test job passes — a failing
+  # test blocks the deploy. The simulation itself always succeeds: it verifies
+  # the workspace is build-ready (type-check stands in for a build step, since
+  # the services run TS directly via tsx) and echoes the deploy steps.
+  deploy:
+    name: Deploy (simulation)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify build-ready
+        run: pnpm type-check
+
+      - name: Simulate deploy
+        run: |
+          echo "✅ Tests passed — proceeding with deploy simulation"
+          for service in orchestrator-service scanner-service generator-service sync-service; do
+            echo "🚀 Deploying $service ..."
+            echo "   - building image"
+            echo "   - pushing to registry"
+            echo "   - rolling out"
+            echo "   ✔ $service deployed"
+          done
+          echo "🎉 Deploy simulation complete"

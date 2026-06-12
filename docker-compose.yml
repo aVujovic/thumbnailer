@@ -1,0 +1,49 @@
+#   - Kafka API (host):   localhost:29092   <- services connect here
+#   - Admin API:          localhost:29644
+#   - Console UI:         http://localhost:8086
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: thumbnailer-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:29092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:28082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:28082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:28081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --smp=1
+      - --memory=1G
+      - --mode=dev-container
+      - --default-log-level=warn
+    ports:
+      - "29092:29092"   # Kafka API (host -> services)
+      - "28081:28081"   # Schema Registry
+      - "28082:28082"   # Pandaproxy (REST)
+      - "29644:9644"    # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info -X brokers=localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    container_name: thumbnailer-redpanda-console
+    ports:
+      - "8086:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+volumes:
+  redpanda_data:

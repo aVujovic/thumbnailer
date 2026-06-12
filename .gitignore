@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.turbo/
+*.log
+.env
+.DS_Store
+/output/
+apps/generator-service/output
+/videoDb.jsonl
+PLAN.md
+.claude
