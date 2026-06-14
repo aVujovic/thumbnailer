@@ -98,6 +98,16 @@ describe('ThumbnailReadyConsumer', () => {
     ]);
   });
 
+  it('tolerates a commit failure — logs and does NOT throw out of eachMessage', async () => {
+    const { handler, commitOffsets, markSynced, logger } = await harness();
+    commitOffsets.mockRejectedValueOnce(new Error('rebalance: partition revoked'));
+
+    await expect(handler(payload(serializeThumbnailReady(event)))).resolves.toBeUndefined();
+
+    expect(markSynced).toHaveBeenCalledOnce(); // work was done
+    expect(logger.lines.some((l) => l.message?.includes('offset commit failed'))).toBe(true);
+  });
+
   it('does NOT commit when the sync fails (crash → redeliver)', async () => {
     const { handler, commitOffsets, markSynced } = await harness({ syncThrows: true });
 

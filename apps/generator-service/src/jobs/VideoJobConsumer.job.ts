@@ -93,7 +93,7 @@ export class VideoJobConsumer {
         );
         if (!job) {
           // poison message — already warned; commit so we don't re-read it.
-          await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+          await this.commitSafely(consumer);
           return;
         }
 
@@ -102,11 +102,30 @@ export class VideoJobConsumer {
         // Write-ahead commit: only AFTER process() reaches a terminal state
         // (generated / skipped / failed-after-retries). A crash before this
         // line never commits, so the message is redelivered.
-        await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+        await this.commitSafely(consumer);
       },
     });
 
     this.running = true;
+  }
+
+  /**
+   * Commit pending offsets, tolerating a commit failure. A failed commit (e.g. a
+   * rebalance revoked the partition, or a transient broker error) must NOT throw
+   * out of eachMessage — that would kill the consumer loop. `commitPending` only
+   * clears its map AFTER a successful commitOffsets, so on failure the offsets
+   * stay pending and the next message's commit retries them. Worst case the
+   * message is reprocessed (idempotent: skip-if-exists), never lost.
+   */
+  private async commitSafely(consumer: NonNullable<KafkaConnection['consumer']>): Promise<void> {
+    try {
+      await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+    } catch (err) {
+      this.logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'offset commit failed — will retry on next message (work already done)',
+      );
+    }
   }
 
   /**

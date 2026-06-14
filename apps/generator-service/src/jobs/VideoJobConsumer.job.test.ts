@@ -94,6 +94,21 @@ function commandPayload(value: Buffer): EachMessagePayload {
 }
 
 describe('VideoJobConsumer commit semantics', () => {
+  it('tolerates a commit failure — logs and does NOT throw out of eachMessage', async () => {
+    const { handler, commitOffsets, logger, saved } = await harness({
+      status: 'generated',
+      outputPath: '/out/data/clip.mp4.jpg',
+      attempts: 1,
+    });
+    commitOffsets.mockRejectedValueOnce(new Error('rebalance: partition revoked'));
+
+    // A throw here would kill the consumer loop — it must not propagate.
+    await expect(handler(payload(serializeVideoJob(job)))).resolves.toBeUndefined();
+
+    expect(saved).toHaveLength(1); // work was done
+    expect(logger.lines.some((l) => l.message?.includes('offset commit failed'))).toBe(true);
+  });
+
   it('commits offset+1 after a successful generation (write-ahead)', async () => {
     const { handler, commitOffsets, generator } = await harness({
       status: 'generated',

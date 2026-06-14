@@ -117,6 +117,71 @@ describe('ScanManager', () => {
     expect(h.events.some((e) => e.type === 'ScanCancelled' && e.scanId === 'A')).toBe(true);
   });
 
+  it('emits ScanFailed (not a throw) when produce fails mid-walk', async () => {
+    const { mgr, events, produced, logger } = harness(fakeScanner(5));
+    // make the 3rd produce throw (broker went away mid-walk)
+    let n = 0;
+    (mgr as unknown as { jobProducer: JobProducer }).jobProducer.produce = vi.fn(
+      async (path: string) => {
+        if (++n === 3) throw new Error('broker unreachable');
+        produced.push({ path });
+      },
+    );
+
+    // must not reject — a throw here would become an unhandled rejection and
+    // crash the daemon.
+    await expect((async () => {
+      mgr.enqueue({ scanId: 'A', scanRoot: '/a' });
+      await flush();
+    })()).resolves.toBeUndefined();
+
+    const last = events.at(-1)!;
+    expect(last.type).toBe('ScanFailed');
+    expect(last).toMatchObject({ scanId: 'A', reason: 'broker unreachable', produced: 2 });
+    expect(produced.length).toBe(2); // two succeeded before the failure
+    expect(logger.lines.some((l) => l.message?.includes('scan failed'))).toBe(true);
+  });
+
+  it('a failed scan does not abandon the rest of the queue', async () => {
+    const { mgr, events, produced } = harness(fakeScanner(2));
+    // only /a's produces fail; /b succeeds — deterministic by scan root
+    (mgr as unknown as { jobProducer: JobProducer }).jobProducer.produce = vi.fn(
+      async (path: string) => {
+        if (path.startsWith('/a/')) throw new Error('broker down');
+        produced.push({ path });
+      },
+    );
+
+    mgr.enqueue({ scanId: 'A', scanRoot: '/a' }); // will fail
+    mgr.enqueue({ scanId: 'B', scanRoot: '/b' }); // must still run
+    await flush();
+
+    // A failed, B still completed — the queue wasn't abandoned by A's failure.
+    expect(events.some((e) => e.type === 'ScanFailed' && e.scanId === 'A')).toBe(true);
+    expect(events.some((e) => e.type === 'ScanCompleted' && e.scanId === 'B')).toBe(true);
+    expect(produced.some((p) => p.path.startsWith('/b/'))).toBe(true);
+  });
+
+  it('emits ScanFailed if even ScanStarted cannot be published', async () => {
+    const { mgr, events, logger } = harness(fakeScanner(1));
+    (mgr as unknown as { eventProducer: EventProducer }).eventProducer.emit = vi.fn(async () => {
+      throw new Error('broker down at start');
+    });
+
+    await expect((async () => {
+      mgr.enqueue({ scanId: 'A', scanRoot: '/a' });
+      await flush();
+    })()).resolves.toBeUndefined();
+
+    // every emit throws, so no event lands, but the daemon survives and logs it.
+    expect(events.length).toBe(0);
+    expect(
+      logger.lines.some(
+        (l) => l.message?.includes('scan failed') || l.message?.includes('failed to emit'),
+      ),
+    ).toBe(true);
+  });
+
   it('stop(scanId) drops a not-yet-running queued scan', async () => {
     // slow first scan so B is still queued when we drop it
     let resolveFirst!: () => void;
