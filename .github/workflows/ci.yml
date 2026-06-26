@@ -35,9 +35,23 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # The Prisma client is generated from the schema (gitignored), so it must
-      # be generated before type-check / tests can resolve @thumbnailer/db.
+      # exist before type-check / tests can resolve @thumbnailer/db. Run prisma
+      # from the package dir directly, then assert the client landed — so a
+      # silent generate failure fails THIS step loudly, not a later one.
       - name: Generate Prisma client
-        run: pnpm db:generate
+        working-directory: packages/db
+        env:
+          # prisma generate reads DATABASE_URL from prisma/.env, which is
+          # gitignored (so absent on CI). generate doesn't need a real DB, but a
+          # value keeps it from warning/failing on a missing env var.
+          DATABASE_URL: postgres://thumbnailer:thumbnailer@localhost:5432/thumbnailer
+        run: |
+          pnpm exec prisma -v
+          pnpm exec prisma generate
+          echo "--- generated client contents ---"
+          ls -la generated/prisma/client/ | head
+          test -f generated/prisma/client/index.js \
+            || (echo "::error::Prisma client was not generated" && exit 1)
 
       - name: Type-check
         run: pnpm type-check
