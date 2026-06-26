@@ -4,9 +4,11 @@
 // batch safe.
 
 generator client {
-  provider   = "prisma-client-js"
-  moduleType = "esm"
-  output     = "../generated/prisma/client"
+  provider      = "prisma-client-js"
+  moduleType    = "esm"
+  output        = "../generated/prisma/client"
+  // native = local dev; debian/rhel = CI (ubuntu-latest) + most Linux containers.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
