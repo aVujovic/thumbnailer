@@ -1,11 +1,12 @@
 import { z } from 'zod';
 
 /**
- * The status of one video — a row in the "video DB". In production this is a row
- * in a Postgres/MySQL table; here it's one line in `videoDb.jsonl` (JSONL). The
- * shape is the same either way, which is why it lives in contracts (the "table
- * schema"). The generator INSERTs a row per processed video; the sync-service
- * later UPDATEs that row's `synced` flag to true once the thumbnail is synced.
+ * The status of one video — a row in the "video DB" (a Postgres `videos` table;
+ * see packages/db). Lives in contracts because it's the shape carried by the
+ * upsert WriteCommand: the generator emits a row per processed video
+ * (`synced: false`), and the sync-service later emits a mark-synced command that
+ * flips that row's `synced` flag once the thumbnail is synced. The db-flush-service
+ * is the only thing that actually writes it.
  */
 export const ThumbnailResultSchema = z.object({
   /** The scan this result belongs to (if the job carried one). */

@@ -6,6 +6,6 @@ dist/
 .DS_Store
 /output/
 apps/generator-service/output
-/videoDb.jsonl
+packages/db/generated/
 PLAN.md
 .claude

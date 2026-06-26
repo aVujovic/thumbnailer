@@ -1,0 +1,43 @@
+// The "video DB" — one row per processed video, written exclusively by the
+// db-flush-service. Mirrors the ThumbnailResult contract. video_path is the
+// primary key, which makes the generator's upsert idempotent and a redelivered
+// batch safe.
+
+generator client {
+  provider   = "prisma-client-js"
+  moduleType = "esm"
+  output     = "../generated/prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum VideoStatus {
+  generated
+  skipped
+  failed
+}
+
+model Video {
+  videoPath    String      @id @map("video_path")
+  scanId       String?     @map("scan_id")
+  tenantId     String?     @map("tenant_id")
+  outputPath   String      @map("output_path")
+  size         BigInt
+  discoveredAt BigInt      @map("discovered_at")
+  format       String
+  status       VideoStatus
+  attempts     Int
+  error        String?
+  processedAt  BigInt      @map("processed_at")
+  synced       Boolean     @default(false)
+  syncedAt     BigInt?     @map("synced_at")
+
+  // "what's generated but not yet synced" (sync backlog / dashboards)
+  @@index([synced])
+  // group rows back to their tenant
+  @@index([tenantId])
+  @@map("videos")
+}

@@ -34,6 +34,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The Prisma client is generated from the schema (gitignored), so it must
+      # be generated before type-check / tests can resolve @thumbnailer/db.
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
       - name: Type-check
         run: pnpm type-check
 
@@ -70,7 +75,7 @@ jobs:
       - name: Simulate deploy
         run: |
           echo "✅ Tests passed — proceeding with deploy simulation"
-          for service in orchestrator-service scanner-service generator-service sync-service; do
+          for service in orchestrator-service scanner-service generator-service sync-service db-flush-service; do
             echo "🚀 Deploying $service ..."
             echo "   - building image"
             echo "   - pushing to registry"

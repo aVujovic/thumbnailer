@@ -4,7 +4,6 @@ import type { StartThumbnailProcess } from '@thumbnailer/domain';
 import type { GeneratorConfig } from './config.schema.js';
 import type { IThumbnailStore } from './thumbnail/ThumbnailStore.js';
 import type { ThumbnailGenerator } from './thumbnail/ThumbnailGenerator.js';
-import type { IResultRepository } from './repository/ResultRepository.js';
 import type VideoJobConsumer from './jobs/VideoJobConsumer.job.js';
 
 /** Full DI cradle for generator-service: core infra + this service's classes. */
@@ -13,7 +12,6 @@ export interface GeneratorCradle extends CoreCradle {
   startThumbnailProcess: StartThumbnailProcess;
   thumbnailStore: IThumbnailStore;
   thumbnailGenerator: ThumbnailGenerator;
-  resultRepository: IResultRepository;
   videoJobConsumer: VideoJobConsumer;
 }
 
