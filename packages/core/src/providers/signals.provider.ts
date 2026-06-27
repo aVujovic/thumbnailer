@@ -54,12 +54,19 @@ export class Signals {
       `👋 Shutting down${signal ? ` (${signal})` : ''} — running ${this.handlers.length} teardown handler(s)`,
     );
 
-    const results = await Promise.allSettled(this.handlers.map((h) => h()));
+    // Run handlers SEQUENTIALLY in registration order. Teardown has ordering
+    // dependencies (e.g. stop the consumer / drain in-flight work BEFORE
+    // disconnecting the producer it writes to), so a parallel allSettled would
+    // race them — a producer could be disconnected while an in-flight message is
+    // still trying to produce. A failing handler is logged but never blocks the
+    // rest, so one bad teardown can't strand the others.
     let failures = 0;
-    for (const r of results) {
-      if (r.status === 'rejected') {
+    for (const handler of this.handlers) {
+      try {
+        await handler();
+      } catch (err) {
         failures++;
-        this.logger.warn({ err: String(r.reason) }, 'Teardown handler failed');
+        this.logger.warn({ err: String(err) }, 'Teardown handler failed');
       }
     }
 

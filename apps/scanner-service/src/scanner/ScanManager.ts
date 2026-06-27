@@ -87,8 +87,18 @@ export class ScanManager {
         const scan = this.queue.shift()!;
         this.running = scan;
         this.cancelled = false;
-        await this.runScan(scan);
-        this.running = null;
+        try {
+          await this.runScan(scan);
+        } catch (err) {
+          // runScan is written not to throw, but guard anyway: one scan's
+          // failure must never abandon the rest of the queue or leak `running`.
+          this.logger.error(
+            { scanId: scan.scanId, err: errMsg(err) },
+            'unexpected error draining scan — continuing with queue',
+          );
+        } finally {
+          this.running = null;
+        }
       }
     } finally {
       this.draining = false;
@@ -98,45 +108,73 @@ export class ScanManager {
   private async runScan(scan: QueuedScan): Promise<void> {
     const { scanId, scanRoot, tenantId } = scan;
     const tenant = tenantId ? { tenantId } : {};
-    await this.eventProducer.emit({
-      type: 'ScanStarted',
-      scanId,
-      scanRoot,
-      ...tenant,
-      startedAt: this.now(),
-    });
-    this.logger.info({ scanId, scanRoot, tenantId }, 'scan started');
-
     let produced = 0;
-    for await (const { path, info } of this.fileScanner.walk(scanRoot)) {
-      if (this.cancelled) break;
-      try {
+    try {
+      await this.eventProducer.emit({
+        type: 'ScanStarted',
+        scanId,
+        scanRoot,
+        ...tenant,
+        startedAt: this.now(),
+      });
+      this.logger.info({ scanId, scanRoot, tenantId }, 'scan started');
+
+      for await (const { path, info } of this.fileScanner.walk(scanRoot)) {
+        if (this.cancelled) break;
         await this.jobProducer.produce(path, info, { scanId, tenantId });
         produced++;
-      } catch (err) {
-        if (this.cancelled) break;
-        throw err;
+      }
+    } catch (err) {
+      // A produce/emit failure (e.g. the broker went away mid-walk) must NOT
+      // crash the daemon — it would take down the whole scanner and the queue
+      // with it. If we were cancelled, fall through to emit ScanCancelled (the
+      // error is just the in-flight produce losing the broker as we stop).
+      // Otherwise emit a terminal ScanFailed so the orchestrator still sees an
+      // end state, then return; the drain loop moves on to the next scan.
+      if (!this.cancelled) {
+        const reason = errMsg(err);
+        this.logger.error({ scanId, produced, err: reason }, 'scan failed');
+        await this.eventProducer
+          .emit({ type: 'ScanFailed', scanId, ...tenant, produced, reason, failedAt: this.now() })
+          .catch((emitErr) =>
+            // If even the failure event can't be published (broker still down),
+            // there's nothing more to do but log — never rethrow out of runScan.
+            this.logger.error(
+              { scanId, err: errMsg(emitErr) },
+              'failed to emit ScanFailed (broker unreachable?)',
+            ),
+          );
+        return;
       }
     }
 
-    if (this.cancelled) {
-      await this.eventProducer.emit({
-        type: 'ScanCancelled',
-        scanId,
-        ...tenant,
-        produced,
-        cancelledAt: this.now(),
-      });
-      this.logger.info({ scanId, produced }, 'scan cancelled');
-    } else {
-      await this.eventProducer.emit({
-        type: 'ScanCompleted',
-        scanId,
-        ...tenant,
-        produced,
-        completedAt: this.now(),
-      });
-      this.logger.info({ scanId, produced }, 'scan complete');
+    // Terminal event is best-effort: if the broker is unreachable here too, log
+    // rather than throw — a throw would propagate to drain() and kill the daemon.
+    try {
+      if (this.cancelled) {
+        await this.eventProducer.emit({
+          type: 'ScanCancelled',
+          scanId,
+          ...tenant,
+          produced,
+          cancelledAt: this.now(),
+        });
+        this.logger.info({ scanId, produced }, 'scan cancelled');
+      } else {
+        await this.eventProducer.emit({
+          type: 'ScanCompleted',
+          scanId,
+          ...tenant,
+          produced,
+          completedAt: this.now(),
+        });
+        this.logger.info({ scanId, produced }, 'scan complete');
+      }
+    } catch (err) {
+      this.logger.error(
+        { scanId, produced, err: errMsg(err) },
+        'failed to emit terminal scan event (broker unreachable?)',
+      );
     }
   }
 
@@ -144,6 +182,10 @@ export class ScanManager {
   get isRunning(): boolean {
     return this.running !== null;
   }
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 export default ScanManager;

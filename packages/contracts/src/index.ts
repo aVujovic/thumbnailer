@@ -3,6 +3,7 @@ export {
   TOPIC_SCAN_COMMANDS,
   TOPIC_SCAN_EVENTS,
   TOPIC_THUMBNAIL_READY,
+  TOPIC_DB_FLUSH,
 } from './topics.js';
 export {
   VideoJobSchema,
@@ -22,6 +23,13 @@ export {
   parseThumbnailReady,
   type ThumbnailReady,
 } from './thumbnailReady.js';
+export {
+  WriteCommandSchema,
+  writeCommands,
+  serializeWriteCommand,
+  parseWriteCommand,
+  type WriteCommand,
+} from './writeCommand.js';
 export {
   SCAN_COMMAND,
   scanCommands,

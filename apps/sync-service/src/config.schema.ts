@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { booleanish, resolvePath } from '@thumbnailer/core';
+import { booleanish } from '@thumbnailer/core';
 
 /**
  * Sync-service config, validated against process.env at startup. A consumer-only
@@ -15,10 +15,9 @@ export const ConfigSchema = z
     KAFKA_SESSION_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     KAFKA_FROM_BEGINNING: booleanish.default('true'),
     TOPIC_THUMBNAIL_READY: z.string().min(1).default('thumbnail-ready'),
-
-    // The shared "video DB" — same file the generator writes. Lives at the repo
-    // root beside tenants.json. The sync-service flips each row's `synced` flag.
-    VIDEO_DB_PATH: z.string().min(1).default('../../videoDb.jsonl'),
+    // The sync-service no longer updates the DB inline — it emits a mark-synced
+    // WriteCommand onto this topic for the db-flush-service to persist.
+    TOPIC_DB_FLUSH: z.string().min(1).default('db-flush'),
     // Simulated per-sync latency (ms) so the daemon visibly does work; the real
     // sync (rsync/S3/scp) would take this place. 0 = no delay.
     SYNC_DELAY_MS: z.coerce.number().int().nonnegative().default(0),
@@ -36,14 +35,15 @@ export const ConfigSchema = z
     shutdownGraceMs: env.SHUTDOWN_GRACE_MS,
 
     readyTopic: env.TOPIC_THUMBNAIL_READY,
+    flushTopic: env.TOPIC_DB_FLUSH,
     fromBeginning: env.KAFKA_FROM_BEGINNING,
-    videoDbPath: resolvePath(env.VIDEO_DB_PATH),
     syncDelayMs: env.SYNC_DELAY_MS,
 
     kafka: {
       brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),
       clientId: env.KAFKA_CLIENT_ID,
-      mode: 'consumer' as const,
+      // Consumes thumbnail-ready, produces mark-synced WriteCommands.
+      mode: 'both' as const,
       consumer: {
         groupId: env.SYNC_GROUP_ID,
         sessionTimeoutMs: env.KAFKA_SESSION_TIMEOUT_MS,

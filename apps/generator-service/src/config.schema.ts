@@ -19,10 +19,10 @@ export const ConfigSchema = z
 
     OUTPUT_ROOT: z.string().min(1).default('./output'),
     THUMBNAIL_FORMAT: z.string().min(1).default('jpg'),
-    // The "video DB" path (JSONL). Lives at the repo root beside tenants.json so
-    // the generator (writer) and sync-service (updater) share one store.
-    VIDEO_DB_PATH: z.string().min(1).default('../../videoDb.jsonl'),
     TOPIC_THUMBNAIL_READY: z.string().min(1).default('thumbnail-ready'),
+    // The generator no longer writes the DB inline — it emits an upsert
+    // WriteCommand onto this topic for the db-flush-service to persist.
+    TOPIC_DB_FLUSH: z.string().min(1).default('db-flush'),
 
     GENERATE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
     GENERATE_MAX_RETRIES: z.coerce.number().int().nonnegative().default(2),
@@ -54,8 +54,8 @@ export const ConfigSchema = z
     // thumbnail output
     outputRoot: resolvePath(env.OUTPUT_ROOT),
     thumbnailFormat: env.THUMBNAIL_FORMAT.toLowerCase().replace(/^\./, ''),
-    resultsPath: resolvePath(env.VIDEO_DB_PATH),
     readyTopic: env.TOPIC_THUMBNAIL_READY,
+    flushTopic: env.TOPIC_DB_FLUSH,
 
     // generation behaviour
     timeoutMs: env.GENERATE_TIMEOUT_MS,

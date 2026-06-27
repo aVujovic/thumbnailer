@@ -14,3 +14,6 @@ export const TOPIC_SCAN_EVENTS = 'scan-events';
 
 /** Thumbnail ready: generator (producer) -> sync-service (consumer). */
 export const TOPIC_THUMBNAIL_READY = 'thumbnail-ready';
+
+/** DB writes: generator + sync (producers) -> db-flush-service (consumer). */
+export const TOPIC_DB_FLUSH = 'db-flush';

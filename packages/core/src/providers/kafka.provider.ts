@@ -27,6 +27,10 @@ export interface KafkaConnectorConfig {
   consumer?: {
     groupId: string;
     sessionTimeoutMs?: number;
+    /** Max time (ms) the consumer waits to fill a fetch before returning a
+     *  partial batch. The time-bound for micro-batching: a quiet topic flushes
+     *  after this, a busy one fills the fetch sooner. kafkajs `maxWaitTimeInMs`. */
+    maxWaitTimeMs?: number;
   };
   /** Producer tunables forwarded verbatim to `kafka.producer({...})`. */
   producer?: {
@@ -86,6 +90,9 @@ const kafkaProvider = ({ logger, config }: ProviderDeps): KafkaConnection => {
       groupId: cfg.consumer!.groupId,
       ...(cfg.consumer!.sessionTimeoutMs !== undefined
         ? { sessionTimeout: cfg.consumer!.sessionTimeoutMs }
+        : {}),
+      ...(cfg.consumer!.maxWaitTimeMs !== undefined
+        ? { maxWaitTimeInMs: cfg.consumer!.maxWaitTimeMs }
         : {}),
     });
     connection.consumer = consumer;

@@ -4,7 +4,6 @@ import { asClass } from 'awilix';
 import container from './container.js';
 import { ConfigSchema } from './config.schema.js';
 import LoggingSyncTarget from './sync/SyncTarget.js';
-import JsonlVideoDb from './repository/VideoDb.js';
 import ThumbnailReadyConsumer from './jobs/ThumbnailReadyConsumer.job.js';
 
 /**
@@ -19,7 +18,8 @@ const main = async (): Promise<void> => {
   container.register({
     // Log-only in this assessment; rsync/scp/S3 in production (same interface).
     syncTarget: asClass(LoggingSyncTarget).singleton(),
-    videoDb: asClass(JsonlVideoDb).singleton(),
+    // No DB repo here anymore — sync emits a mark-synced WriteCommand onto the
+    // db-flush topic; the db-flush-service persists it.
     thumbnailReadyConsumer: asClass(ThumbnailReadyConsumer).singleton(),
   });
 

@@ -7,8 +7,8 @@ interface EventProducerConfig {
 }
 
 /**
- * Emits scan lifecycle events (ScanStarted / ScanCompleted / ScanCancelled)
- * onto the events topic, for the orchestrator / observers to react to.
+ * Emits scan lifecycle events (ScanStarted / ScanCompleted / ScanCancelled /
+ * ScanFailed) onto the events topic, for the orchestrator / observers to react to.
  */
 export class EventProducer {
   private readonly kafka: KafkaConnection;

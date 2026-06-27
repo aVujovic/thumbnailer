@@ -45,5 +45,27 @@ services:
       redpanda:
         condition: service_healthy
 
+  # The "video DB" — a real Postgres table, written exclusively by the
+  # db-flush-service (async write-behind). Schema is managed by Prisma migrations
+  # (packages/db); run `pnpm db:setup` after infra is up.
+  postgres:
+    image: postgres:16-alpine
+    container_name: thumbnailer-postgres
+    environment:
+      POSTGRES_USER: thumbnailer
+      POSTGRES_PASSWORD: thumbnailer
+      POSTGRES_DB: thumbnailer
+    ports:
+      # Host 5433 (5432 is often taken by another local Postgres); container 5432.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U thumbnailer -d thumbnailer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   redpanda_data:
+  postgres_data:

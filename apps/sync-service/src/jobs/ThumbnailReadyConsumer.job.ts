@@ -1,17 +1,21 @@
-import { parseThumbnailReady, type ThumbnailReady } from '@thumbnailer/contracts';
+import {
+  parseThumbnailReady,
+  serializeWriteCommand,
+  writeCommands,
+  type ThumbnailReady,
+} from '@thumbnailer/contracts';
 import type { ILogger } from '@thumbnailer/domain';
 import type { KafkaConnection, KafkaUtils } from '@thumbnailer/core';
 import type { SyncConfig } from '../config.schema.js';
 import type { ISyncTarget } from '../sync/SyncTarget.js';
-import type { IVideoDb } from '../repository/VideoDb.js';
 
 /**
  * Long-running consumer for the thumbnail-ready topic. For each ready thumbnail
- * it syncs the file to its destination, then marks the video's row synced in the
- * video DB — using the same write-ahead commit pattern as the generator: the
- * offset is committed only AFTER the sync + DB update succeed, so a crash
- * mid-sync redelivers the event (sync is idempotent — re-marking a row synced is
- * a no-op).
+ * it syncs the file to its destination, then emits a mark-synced WriteCommand
+ * onto the db-flush topic (write-behind) — using the same write-ahead commit
+ * pattern as the generator: the offset is committed only AFTER the sync + emit
+ * succeed, so a crash mid-sync redelivers the event (sync is idempotent, and
+ * the mark-synced upsert is idempotent too — re-marking synced is a no-op).
  */
 export class ThumbnailReadyConsumer {
   private readonly logger: ILogger;
@@ -19,7 +23,6 @@ export class ThumbnailReadyConsumer {
   private readonly kafka: KafkaConnection;
   private readonly kafkaUtils: KafkaUtils;
   private readonly target: ISyncTarget;
-  private readonly db: IVideoDb;
   private readonly now: () => number;
 
   private readonly pendingOffsets = new Map<string, string>();
@@ -32,7 +35,6 @@ export class ThumbnailReadyConsumer {
       kafka: KafkaConnection;
       kafkaUtils: KafkaUtils;
       syncTarget: ISyncTarget;
-      videoDb: IVideoDb;
     },
     now: () => number = Date.now,
   ) {
@@ -41,7 +43,6 @@ export class ThumbnailReadyConsumer {
     this.kafka = deps.kafka;
     this.kafkaUtils = deps.kafkaUtils;
     this.target = deps.syncTarget;
-    this.db = deps.videoDb;
     this.now = now;
   }
 
@@ -58,7 +59,7 @@ export class ThumbnailReadyConsumer {
       {
         topic: this.config.readyTopic,
         groupId: this.config.kafka.consumer.groupId,
-        videoDb: this.config.videoDbPath,
+        flushTopic: this.config.flushTopic,
       },
       'sync-service started — waiting for ready thumbnails',
     );
@@ -74,14 +75,14 @@ export class ThumbnailReadyConsumer {
         );
         if (!event) {
           // poison message — already warned; commit so we don't re-read it.
-          await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+          await this.commitSafely(consumer);
           return;
         }
 
         await this.handle(event);
 
         // Write-ahead commit: only AFTER the sync + DB update succeed.
-        await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+        await this.commitSafely(consumer);
       },
     });
 
@@ -89,20 +90,38 @@ export class ThumbnailReadyConsumer {
   }
 
   /**
-   * Sync one ready thumbnail and flip its row to synced in the video DB. A
-   * missing row (event arrived before the generator's write, or for a video not
-   * in this DB) is logged but still treated as terminal — the file was synced;
-   * there's just no row to update, and redelivering wouldn't create one.
+   * Commit pending offsets, tolerating a commit failure. A failed commit (e.g. a
+   * rebalance revoked the partition, or a transient broker error) must NOT throw
+   * out of eachMessage — that would kill the consumer loop. `commitPending` only
+   * clears its map AFTER a successful commitOffsets, so on failure the offsets
+   * stay pending and the next message's commit retries them. Worst case the
+   * thumbnail is re-synced (idempotent: re-marking synced is a no-op), never lost.
+   */
+  private async commitSafely(consumer: NonNullable<KafkaConnection['consumer']>): Promise<void> {
+    try {
+      await this.kafkaUtils.commitPending(consumer, this.pendingOffsets);
+    } catch (err) {
+      this.logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'offset commit failed — will retry on next message (work already done)',
+      );
+    }
+  }
+
+  /**
+   * Sync one ready thumbnail, then emit a mark-synced WriteCommand (write-behind)
+   * keyed by videoPath. Both steps run before the caller commits, so a crash
+   * mid-sync redelivers — sync is idempotent and the mark-synced upsert is too.
+   * The emit is NOT best-effort: if it throws, the offset isn't committed and the
+   * event redelivers, so a sync is never silently dropped.
    */
   async handle(event: ThumbnailReady): Promise<void> {
     await this.target.sync(event);
-    const updated = await this.db.markSynced(event.videoPath, this.now());
-    if (!updated) {
-      this.logger.warn(
-        { videoPath: event.videoPath },
-        'synced, but no video-DB row to mark (event arrived before its row?)',
-      );
-    }
+    const cmd = writeCommands.markSynced(event.videoPath, this.now());
+    await this.kafka.producer!.send({
+      topic: this.config.flushTopic,
+      messages: [{ key: cmd.key, value: serializeWriteCommand(cmd) }],
+    });
   }
 }
 

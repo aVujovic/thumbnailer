@@ -6,7 +6,6 @@ import { ConfigSchema, type GeneratorConfig } from './config.schema.js';
 import { makeStartThumbnailProcess } from './ffmpeg/startThumbnailProcess.js';
 import LocalThumbnailStore from './thumbnail/ThumbnailStore.js';
 import ThumbnailGenerator from './thumbnail/ThumbnailGenerator.js';
-import JsonlResultRepository from './repository/ResultRepository.js';
 import VideoJobConsumer from './jobs/VideoJobConsumer.job.js';
 
 /**
@@ -29,8 +28,8 @@ const main = async (): Promise<void> => {
     ).singleton(),
     thumbnailStore: asClass(LocalThumbnailStore).singleton(),
     thumbnailGenerator: asClass(ThumbnailGenerator).singleton(),
-    // Result sink — JSONL now, a DB repository in production (same interface).
-    resultRepository: asClass(JsonlResultRepository).singleton(),
+    // No DB repo here anymore — the generator emits an upsert WriteCommand onto
+    // the db-flush topic; the db-flush-service persists it.
     videoJobConsumer: asClass(VideoJobConsumer).singleton(),
   });
 

@@ -2,37 +2,36 @@
 
 Scans a file system for video files and generates thumbnail preview images for them.
 
-The work is split into **four decoupled services** connected by **Redpanda** (Kafka-wire-compatible
+The work is split into **five decoupled services** connected by **Redpanda** (Kafka-wire-compatible
 broker): an **orchestrator** that issues commands, a **scanner** that discovers videos on demand, a
-**generator** that produces thumbnails, and a **sync-service** that replicates finished thumbnails to
-their destination. This models the real problem shape — a fast, I/O-bound scan feeding a slow,
-CPU-bound generation step, followed by a delivery step — and lets the parts scale, fail, and be
-controlled independently. Nothing scans automatically: the scanner, generator, and sync-service are
-long-lived daemons that sit idle until commanded / fed work.
+**generator** that produces thumbnails, a **sync-service** that replicates finished thumbnails to their
+destination, and a **db-flush-service** that persists the "video DB" to **Postgres** in batches. This
+models the real problem shape — a fast, I/O-bound scan feeding a slow, CPU-bound generation step,
+followed by a delivery step and an async write-behind to the database — and lets the parts scale, fail,
+and be controlled independently. Nothing scans automatically: the daemons sit idle until commanded /
+fed work.
 
 ---
 
 ## How it works
 
 All messages flow through **Redpanda** — every service only produces to or consumes from a topic;
-no service talks to another directly. The broker is the hub in the middle, holding four topics:
+no service talks to another directly. The broker is the hub in the middle, holding five topics:
 
 ```
-  orchestrator        scanner-service          generator-service          sync-service
-  (CLI, one-shot)     (daemon)                 (daemon)                   (daemon)
-        │             ▲       │                ▲    │      │              ▲
-        │ produce     │ scan- │ produce        │    │ scan │ produce      │ consume
-        │ scan-cmds   │ cmds  │ video-jobs     │    │ cmds │ thumbnail-   │ thumbnail-
-        │             │       │ + scan-events  │    │      │ ready        │ ready
-        ▼             │       ▼                │    ▼      ▼              │
-  ╔═════════════════════════════════════════════════════════════════════╪═══════╗
-  ║                            R E D P A N D A                            │       ║
-  ║  [ scan-commands ]   [ video-jobs ]   [ scan-events ]   [ thumbnail-ready ]   ║
-  ╚══════════════════════════════════════════════════════════════════════════════╝
-                                              │                            │
-                                      ffmpeg → thumbnail            "video X synced"
-                                              ▼                            ▼
-                            thumbnails (mirror-tree) + videoDb.jsonl   videoDb row: synced=true
+  orchestrator   scanner-service     generator-service     sync-service     db-flush-service
+  (CLI)          (daemon)            (daemon)              (daemon)         (daemon)
+      │          ▲      │            ▲   │   │  │          ▲   │            ▲
+      │ scan-    │ scan │ video-jobs │   │   │  │ db-flush │   │ db-flush   │ db-flush
+      ▼ cmds     │ cmds ▼ +events    │   ▼   ▼  ▼ (upsert)  │   ▼ (synced)   │
+  ╔══════════════════════════════════════════════════════════════════════╪═════════╗
+  ║                              R E D P A N D A                          │         ║
+  ║ [scan-commands] [video-jobs] [scan-events] [thumbnail-ready] [db-flush]│        ║
+  ╚════════════════════════════════════════════════════════════════════════════════╝
+                          │                          │                    │
+                  ffmpeg → thumbnail         "video X synced"      batch UPSERT → Postgres
+                          ▼                          ▼                    ▼
+                 thumbnails (mirror-tree)    sync destination        videos table
 ```
 
 Who produces and consumes each topic:
@@ -43,12 +42,14 @@ Who produces and consumes each topic:
 | `video-jobs` | scanner | generator |
 | `scan-events` | scanner | orchestrator / observers |
 | `thumbnail-ready` | generator | sync-service |
+| `db-flush` | generator (upsert), sync (mark-synced) | db-flush-service |
 
 So a typical scan is: orchestrator **produces** `StartScan` → scanner **consumes** it, walks the
-directory, and **produces** `VideoJob`s (and `ScanStarted`/`ScanCompleted` events) → generator
-**consumes** the jobs, makes thumbnails, writes a `videoDb.jsonl` row (`synced: false`), and
-**produces** a `ThumbnailReady` event → sync-service **consumes** it, replicates the thumbnail, and
-flips that row to `synced: true`. No service ever calls another — Redpanda sits between every pair.
+directory, and **produces** `VideoJob`s → generator **consumes** the jobs, makes thumbnails, **emits an
+upsert** onto `db-flush` (the DB row, `synced: false`) and a `ThumbnailReady` event → sync-service
+**consumes** the ready event, replicates the thumbnail, and **emits a mark-synced** onto `db-flush` →
+db-flush-service **consumes** `db-flush` and writes everything to **Postgres** in batches. No service
+ever calls another, and no service writes the DB directly — Redpanda sits between every pair.
 
 1. **orchestrator-service** is a thin CLI and the control plane. It resolves a `--tenant <id>` to a
    scan root via the tenant catalog, then publishes one command onto the `scan-commands` topic and
@@ -58,20 +59,24 @@ flips that row to `synced: true`. No service ever calls another — Redpanda sit
    given directory (iteratively, depth-guarded), detects videos by extension, and produces one
    `VideoJob` per video onto `video-jobs` — tagged with the `scanId`. It runs one scan at a time
    (FIFO queue), can be cancelled mid-scan (`StopScan`), and emits `ScanStarted`/`ScanCompleted`/
-   `ScanCancelled` on `scan-events` for the orchestrator to observe.
+   `ScanCancelled`/`ScanFailed` on `scan-events` for the orchestrator to observe.
 3. **Redpanda** holds the queues. The broker provides backpressure (the consumer pulls at its own
    pace), durability, and at-least-once delivery — the scanner never holds the whole work-set in memory.
 4. **generator-service** is a long-lived daemon consuming `video-jobs`. For each job it runs ffmpeg to
    extract a thumbnail, with a per-job timeout (kill on hang), bounded retries with backoff, and
-   idempotent skipping if the thumbnail already exists. It records the outcome (carrying the `scanId`)
-   as a `videoDb.jsonl` row with `synced: false`, and — when a thumbnail actually exists (generated or
-   skipped) — produces a `ThumbnailReady` event for the sync-service. It also consumes `scan-commands`
-   to honour `Pause`/`Resume`. (A `failed` job produces nothing, so it emits no ready event.)
+   idempotent skipping if the thumbnail already exists. It then **emits an upsert `WriteCommand`** onto
+   `db-flush` (the row, `synced: false`) and — when a thumbnail exists (generated or skipped) — a
+   `ThumbnailReady` event. It also consumes `scan-commands` to honour `Pause`/`Resume`. (A `failed` job
+   still writes its row but emits no ready event.)
 5. **sync-service** is a long-lived daemon consuming `thumbnail-ready`. For each event it "syncs" the
-   thumbnail to its destination (a stand-in that logs `video X synced` — in production an rsync / scp /
-   S3 upload to the server that serves the previews), then flips that video's `videoDb.jsonl` row to
-   `synced: true`. Same write-ahead commit as the generator: the offset commits only after the sync +
-   DB update succeed, and re-syncing is idempotent, so a crash mid-sync just redelivers.
+   thumbnail to its destination (a stand-in that logs `video X synced` — in production rsync / scp / S3),
+   then **emits a mark-synced `WriteCommand`** onto `db-flush`. Same write-ahead commit as the generator:
+   the offset commits only after the sync + emit succeed, and re-syncing is idempotent.
+6. **db-flush-service** is a long-lived daemon consuming `db-flush`. It batches `WriteCommand`s and
+   applies them to **Postgres (via Prisma)** in one transaction per batch — an idempotent upsert keyed
+   by `video_path`. The sole writer to the DB: generator and sync no longer touch it. This is async
+   **write-behind** — decoupling generation/sync throughput from DB latency, and batching the writes.
+   See [DB-FLUSH-DESIGN.md](./DB-FLUSH-DESIGN.md).
 
 ### Key principles
 
@@ -104,14 +109,16 @@ flips that row to `synced: true`. No service ever calls another — Redpanda sit
 packages/
 ├── domain/        # @thumbnailer/domain   — pure interfaces (IFileSystem, IProcess, ILogger) + test fakes
 ├── contracts/     # @thumbnailer/contracts — shared schemas/builders (VideoJob, ThumbnailResult,
-│                  #                            ScanCommand, ScanEvent, topic names) via zod
-└── core/          # @thumbnailer/core      — createService() + infra providers (config, logger, kafka,
-                   #                            kafkaUtils, signals, commands) wired into one DI container
+│                  #                            ScanCommand, ScanEvent, WriteCommand, topics) via zod
+├── core/          # @thumbnailer/core      — createService() + infra providers (config, logger, kafka,
+│                  #                            kafkaUtils, signals, commands, db) wired into one DI container
+└── db/            # @thumbnailer/db        — Prisma schema + migrations + createPrismaClient (the video DB)
 apps/
 ├── orchestrator-service/ # CLI: TenantResolver + parseArgs → CommandPublisher → publishes a ScanCommand
 ├── scanner-service/      # daemon: CommandConsumer → ScanManager → FileScanner / JobProducer / EventProducer
-├── generator-service/    # daemon: VideoJobConsumer → ThumbnailGenerator → ThumbnailStore + ResultRepository (videoDb)
-└── sync-service/         # daemon: ThumbnailReadyConsumer → SyncTarget (replicate) → VideoDb (mark synced)
+├── generator-service/    # daemon: VideoJobConsumer → ThumbnailGenerator → emits upsert (db-flush) + ThumbnailReady
+├── sync-service/         # daemon: ThumbnailReadyConsumer → SyncTarget (replicate) → emits mark-synced (db-flush)
+└── db-flush-service/     # daemon: DbFlushConsumer → PrismaDbSink (batch UPSERT into Postgres) — sole DB writer
 ```
 
 - **domain** — the two abstract dependencies from the task (`IFileSystem`,
@@ -124,8 +131,11 @@ apps/
   rejected, not silently mis-processed.
 - **core** — cross-cutting infrastructure as DI providers, registered in one `createService()` call.
   Each service then registers only its own domain classes; everything (logger, config, kafka client,
-  lifecycle/shutdown) arrives via constructor injection. The interesting domain logic — commit
-  semantics, timeout/kill/retry, the scan queue — stays visible in `apps/*`, not hidden in `core`.
+  the Prisma `db` client, lifecycle/shutdown) arrives via constructor injection. The interesting domain
+  logic — commit semantics, timeout/kill/retry, the scan queue — stays visible in `apps/*`, not in `core`.
+- **db** — the video DB as a Prisma package: `schema.prisma` (one `Video` model → `videos` table),
+  migrations, and `createPrismaClient()`. Core's `db` provider wraps it so the client is injected, never
+  `new`d in domain code. Only db-flush-service uses it.
 - **orchestrator-service** — a one-shot CLI and control plane. `TenantResolver` maps `--tenant <id>`
   to a scan root (from `tenants.json`), `parseArgs` turns the sub-command into a typed `ScanCommand`,
   and `CommandPublisher` sends it. No daemon, no business logic — just the control surface.
@@ -133,53 +143,64 @@ apps/
   one at a time (FIFO queue) and is cancellable; `FileScanner` does the iterative walk, `JobProducer`
   emits `VideoJob`s, `EventProducer` emits lifecycle events.
 - **generator-service** — a daemon. `VideoJobConsumer` consumes work + control commands;
-  `ThumbnailGenerator` owns the resilient ffmpeg run; `ThumbnailStore` writes the image and
-  `ResultRepository` writes the `videoDb.jsonl` row; on success it emits a `ThumbnailReady` event.
+  `ThumbnailGenerator` owns the resilient ffmpeg run; `ThumbnailStore` writes the image. It then emits
+  an upsert `WriteCommand` onto `db-flush` (not a direct DB write) and a `ThumbnailReady` event.
 - **sync-service** — a daemon. `ThumbnailReadyConsumer` consumes `thumbnail-ready`; `SyncTarget`
-  replicates the thumbnail (log-only here, rsync/S3 in production); `VideoDb` flips the row's `synced`
-  flag. Both `SyncTarget` and `VideoDb` are interfaces, so the destination and the store are swappable.
+  replicates the thumbnail (log-only here, rsync/S3 in production, behind an interface); it then emits a
+  mark-synced `WriteCommand` onto `db-flush`.
+- **db-flush-service** — a daemon. `DbFlushConsumer` batches `WriteCommand`s off `db-flush`;
+  `PrismaDbSink` applies each batch to Postgres in one transaction (idempotent upsert by `video_path`),
+  behind an `IDbSink` interface. The single writer to the DB.
 
 ---
 
-## The video DB (`videoDb.jsonl` — the production DB equivalent)
+## The video DB (Postgres, via Prisma + async write-behind)
 
-There's one shared store, the **video DB**, holding one row per video — its metadata, the terminal
-generation `status`, and whether its thumbnail has been **synced**. It lives at the repo root
-(`videoDb.jsonl`, beside `tenants.json`) so two services share it: the **generator** INSERTs rows, the
-**sync-service** UPDATEs the `synced` flag.
+The **video DB** holds one row per video — its metadata, the terminal generation `status`, and whether
+its thumbnail has been **synced**. It's a real **Postgres** `videos` table (Prisma schema + migrations
+in `packages/db`), `video_path` as the primary key.
 
-```json
-{"scanId":"s-1","tenantId":"tenant-1","videoPath":"/data/clip.mov","outputPath":"/out/tenant-1/data/clip.mov.jpg","size":3422636,"discoveredAt":1781208138506,"format":"jpg","status":"generated","attempts":1,"processedAt":1781208139348,"synced":true,"syncedAt":1781208140002}
-{"scanId":"s-1","tenantId":"tenant-1","videoPath":"/data/bad.mp4","outputPath":"/out/tenant-1/data/bad.mp4.jpg","size":262,"discoveredAt":1781208138485,"format":"jpg","status":"failed","attempts":3,"error":"exited with code 234","processedAt":1781208139037,"synced":false}
+Crucially, **no service writes the DB directly.** Generator and sync emit `WriteCommand`s onto the
+`db-flush` topic; the **db-flush-service** is the sole writer, applying them to Postgres in **batches**
+(async write-behind). The lifecycle of one row:
+
+- The **generator** emits an `upsert` `WriteCommand` (`synced: false`) for every processed video, and —
+  when a thumbnail exists (`generated` / `skipped`) — a `ThumbnailReady` event. A `failed` video still
+  gets a row, just no ready event.
+- The **sync-service** consumes the ready event, replicates the thumbnail, and emits a `mark-synced`
+  `WriteCommand`.
+- The **db-flush-service** consumes `db-flush`, batches the commands, and applies them in one
+  transaction per batch: `prisma.video.upsert(...)` / `updateMany(...)`, idempotent by `video_path`.
+
+```sql
+-- the resulting rows
+SELECT video_path, status, synced, synced_at FROM videos;
+--      /data/clip.mov  | generated | t | 1781208140002
+--      /data/bad.mp4   | failed    | f | (null)
 ```
 
-Each row carries the video's metadata, the `scanId` + `tenantId` (so rows group back to their scan and
-tenant), the terminal `status` (`generated` | `skipped` | `failed`), and the **sync lifecycle**:
+Why this shape (see [DB-FLUSH-DESIGN.md](./DB-FLUSH-DESIGN.md) for the full rationale):
 
-- The generator writes every row with `synced: false`.
-- For a row whose thumbnail exists (`generated` / `skipped`) it emits a `ThumbnailReady` event.
-- The sync-service consumes that event, replicates the thumbnail, and flips the row to
-  `synced: true` (stamping `syncedAt`). A `failed` row produced no thumbnail, so it's never synced.
-
-This sits behind two interfaces — **`IResultRepository`** (generator-side INSERT, `save()`) and
-**`IVideoDb`** (sync-side UPDATE, `markSynced()`) — over a JSONL implementation. **In production this
-is one Postgres/MySQL table**: `save()` is a row `INSERT`, `markSynced()` is
-`UPDATE videos SET synced=true WHERE path=?`. Swapping the JSONL classes for DB ones touches neither
-consumer nor their tests. JSONL is used here because it gives the same per-row durability without
-standing up a database for the assessment.
+- **Decoupled writes** — generation/sync throughput no longer waits on DB latency; they emit and move on.
+- **Batched** — one transaction per N commands instead of one round-trip per row.
+- **Durable** — same write-ahead commit at every hop (emit before commit, commit after the batch
+  write), so a crash redelivers; the upsert is idempotent, so redelivery never duplicates. At-least-once
+  delivery + idempotent upsert = exactly-once *effect* on the data.
+- **DI'd DB** — the Prisma client is built by core's `db` provider and injected, never `new`d in domain
+  code. Swapping Postgres for another store is a provider change, not a consumer change.
 
 Thumbnails themselves mirror the source tree under `OUTPUT_ROOT/<tenantId>/`
 (e.g. `/data/movies/clip.mov` for `tenant-1` → `OUTPUT_ROOT/tenant-1/data/movies/clip.mov.jpg`) so
 neither two videos nor two tenants can ever collide on the same output path.
 
-### Why a separate sync-service?
+### Why separate sync and db-flush services?
 
-Replication is its own concern with its own failure modes (network, destination down, slow transfers)
-and its own scaling needs (more sync workers when the destination is the bottleneck) — independent of
-how fast thumbnails are generated. Putting it behind its own topic means the generator never blocks on
-a slow upload, the two scale separately, and other consumers (a search indexer, a CDN warmer) can
-react to the same `ThumbnailReady` event without touching the generator. That's the whole point of the
-decoupled, event-driven shape: the producer announces a fact and is done.
+Each is its own concern with its own failure modes and scaling axis. **Sync** (replication) fails on
+network / slow transfers and scales with destination throughput. **db-flush** (persistence) fails on DB
+contention and scales with write volume — and batching there is a big win. Putting each behind its own
+topic means the generator never blocks on a slow upload or a slow DB, the three scale independently, and
+other consumers (a search indexer, a CDN warmer) can react to the same events without touching the
+generator. That's the decoupled, event-driven shape: each producer announces a fact and is done.
 
 ---
 
@@ -187,7 +208,7 @@ decoupled, event-driven shape: the producer announces a fact and is done.
 
 - Node.js >= 20
 - pnpm (`npm i -g pnpm`)
-- Docker (for Redpanda)
+- Docker (for Redpanda + Postgres)
 - ffmpeg on `PATH` (`brew install ffmpeg`). Without it, a placeholder file is written instead of a
   real image so the pipeline still runs end-to-end.
 
@@ -206,20 +227,21 @@ orchestrator**.
 **1. Start infra + both daemons:**
 
 ```bash
-pnpm up        # infra:up + create topics + run scanner, generator & sync daemons
+pnpm up        # infra:up + db:setup + create topics + run all daemons
 ```
 
 Or step by step:
 
 ```bash
-pnpm infra:up        # start Redpanda + Console, waits until healthy
-pnpm topic:create    # create video-jobs / scan-commands / scan-events / thumbnail-ready topics (idempotent)
-pnpm services        # run scanner + generator + sync daemons (no watch)
+pnpm infra:up        # start Redpanda + Console + Postgres, waits until healthy
+pnpm db:setup        # prisma generate + migrate (creates the videos table)
+pnpm topic:create    # create video-jobs / scan-commands / scan-events / thumbnail-ready / db-flush (idempotent)
+pnpm services        # run scanner + generator + sync + db-flush daemons (no watch)
 ```
 
-At this point all three daemons are connected and **idle** — the scanner logs `waiting for commands`,
-the generator `waiting for jobs`, the sync-service `waiting for ready thumbnails`. Nothing happens
-until you tell it to.
+At this point all four daemons are connected and **idle** — the scanner logs `waiting for commands`,
+the generator `waiting for jobs`, the sync-service `waiting for ready thumbnails`, the db-flush-service
+`waiting for write commands`. Nothing happens until you tell it to.
 
 **2. Drive the pipeline with the orchestrator** (in another terminal):
 
@@ -464,16 +486,18 @@ hierarchical sharding above.
 
 - **Redpanda Console** (topics, messages, consumer-group lag): http://localhost:8086
 - **Kafka API**: `localhost:29092`
+- **Postgres** (the video DB): `localhost:5433` (db `thumbnailer`, user/pass `thumbnailer`)
 
 ## Commands
 
 ```bash
 # infra + daemons
-pnpm up              # infra + topics + all daemons
-pnpm services        # scanner + generator + sync daemons (no watch — use this to run)
+pnpm up              # infra + db:setup + topics + all daemons
+pnpm services        # scanner + generator + sync + db-flush daemons (no watch — use this to run)
 pnpm scan            # scanner daemon only
 pnpm generate        # generator daemon only
 pnpm sync            # sync daemon only
+pnpm db-flush        # db-flush daemon only
 pnpm dev             # all daemons in watch mode (development only)
 
 # orchestration (control the running daemons)
@@ -485,16 +509,17 @@ pnpm gen:resume                             # ResumeGenerator
 # tooling
 pnpm test            # run all tests
 pnpm type-check      # type-check all packages
-pnpm infra:up        # start Redpanda + Console
-pnpm infra:down      # stop Redpanda
-pnpm infra:logs      # follow Redpanda logs
+pnpm infra:up        # start Redpanda + Console + Postgres
+pnpm infra:down      # stop infra
+pnpm db:setup        # prisma generate + migrate (creates the videos table)
+pnpm db:generate     # prisma generate only
 pnpm topic:create    # create the topics
 ```
 
 If a consumer group ever gets wedged (e.g. after killing daemons hard), reset it:
 
 ```bash
-docker exec thumbnailer-redpanda rpk group delete scanners thumbnail-generators thumbnail-syncers -X brokers=localhost:9092
+docker exec thumbnailer-redpanda rpk group delete scanners thumbnail-generators thumbnail-syncers db-flushers -X brokers=localhost:9092
 ```
 
 ## Configuration
@@ -509,15 +534,18 @@ readable error). See [.env.example](./.env.example) for the full list. Most-used
 | `SCANNER_GROUP_ID` | scanner | Consumer group for the scanner (must differ from the others') |
 | `GENERATOR_GROUP_ID` | generator | Consumer group for the generator |
 | `SYNC_GROUP_ID` | sync | Consumer group for the sync-service |
+| `DB_FLUSH_GROUP_ID` | db-flush | Consumer group for the db-flush-service |
 | `VIDEO_EXTENSIONS` | scanner | Comma-separated extensions to treat as video |
 | `SCAN_MAX_DEPTH` | scanner | Max directory depth (cheap cycle guard) |
 | `OUTPUT_ROOT` | generator | Where thumbnails are written (`OUTPUT_ROOT/<tenantId>/`, mirror-tree) |
-| `VIDEO_DB_PATH` | generator, sync | Shared video DB (JSONL) path (default repo-root `videoDb.jsonl`) |
 | `THUMBNAIL_FORMAT` | generator | Output image format (`jpg`, `png`, …) |
 | `GENERATE_TIMEOUT_MS` | generator | Per-job timeout before the process is killed |
 | `GENERATE_MAX_RETRIES` | generator | Retries on failure (total attempts = retries + 1) |
 | `GENERATE_FORCE` | generator | Regenerate even if a thumbnail already exists |
 | `SYNC_DELAY_MS` | sync | Simulated per-thumbnail transfer latency (ms, default 0) |
+| `DATABASE_URL` | db-flush, db | Postgres connection string (default `…@localhost:5433/thumbnailer`) |
+| `BATCH_MAX_SIZE` | db-flush | Max commands per DB batch (default 500) |
+| `BATCH_MAX_WAIT_MS` | db-flush | Max fetch wait before flushing a partial batch (default 1000) |
 
 ## Tests
 

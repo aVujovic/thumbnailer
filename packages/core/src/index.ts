@@ -12,3 +12,4 @@ export { makeConfigProvider } from './providers/config.provider.js';
 export { KafkaUtils, type CommittablePosition } from './providers/kafkaUtils.provider.js';
 export { Signals } from './providers/signals.provider.js';
 export { Commands } from './providers/commands.provider.js';
+export { default as dbProvider, type Db } from './providers/db.provider.js';

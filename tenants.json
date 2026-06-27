@@ -1,4 +1,8 @@
 {
-  "tenant-1": { "scanRoot": "~/Downloads" },
-  "tenant-2": { "scanRoot": "~/Desktop" }
+  "tenant-1": {
+    "scanRoot": "~/Downloads"
+  },
+  "tenant-2": {
+    "scanRoot": "~/Desktop"
+  }
 }

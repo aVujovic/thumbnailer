@@ -34,6 +34,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The Prisma client (packages/db/generated) is gitignored, so it must be
+      # generated before type-check / tests can resolve @thumbnailer/db.
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
       - name: Type-check
         run: pnpm type-check
 
@@ -64,13 +69,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Same as the test job: the gitignored Prisma client must exist before
+      # type-check can resolve @thumbnailer/db.
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
       - name: Verify build-ready
         run: pnpm type-check
 
       - name: Simulate deploy
         run: |
           echo "✅ Tests passed — proceeding with deploy simulation"
-          for service in orchestrator-service scanner-service generator-service sync-service; do
+          for service in orchestrator-service scanner-service generator-service sync-service db-flush-service; do
             echo "🚀 Deploying $service ..."
             echo "   - building image"
             echo "   - pushing to registry"

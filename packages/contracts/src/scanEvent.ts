@@ -29,6 +29,16 @@ export const ScanEventSchema = z.discriminatedUnion('type', [
     produced: z.number().int().nonnegative(),
     cancelledAt: z.number().int().nonnegative(),
   }),
+  z.object({
+    type: z.literal('ScanFailed'),
+    scanId: z.string().min(1),
+    tenantId: z.string().min(1).optional(),
+    /** Jobs produced before the failure. */
+    produced: z.number().int().nonnegative(),
+    /** Why the scan aborted (e.g. a broker/producer error mid-walk). */
+    reason: z.string().min(1),
+    failedAt: z.number().int().nonnegative(),
+  }),
 ]);
 
 export type ScanEvent = z.infer<typeof ScanEventSchema>;

@@ -11,19 +11,25 @@
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "infra:logs": "docker compose logs -f",
-    "topic:create": "docker exec thumbnailer-redpanda rpk topic create video-jobs scan-commands scan-events thumbnail-ready -X brokers=localhost:9092 || true",
+    "db:generate": "pnpm --filter @thumbnailer/db generate",
+    "db:setup": "pnpm --filter @thumbnailer/db setup",
+    "db:clean": "docker exec thumbnailer-postgres psql -U thumbnailer -d thumbnailer -c 'TRUNCATE videos;'",
+    "output:clean": "rm -rf apps/generator-service/output",
+    "clean": "pnpm db:clean && pnpm output:clean && echo 'db + generated thumbnails cleaned'",
+    "topic:create": "docker exec thumbnailer-redpanda rpk topic create video-jobs scan-commands scan-events thumbnail-ready db-flush -X brokers=localhost:9092 || true",
     "scan": "pnpm --filter scanner-service start",
     "generate": "pnpm --filter generator-service start",
     "sync": "pnpm --filter sync-service start",
+    "db-flush": "pnpm --filter db-flush-service start",
     "orchestrate": "pnpm --filter orchestrator-service start",
     "scan:start": "pnpm --filter orchestrator-service start start",
     "scan:stop": "pnpm --filter orchestrator-service start stop",
     "gen:pause": "pnpm --filter orchestrator-service start pause",
     "gen:resume": "pnpm --filter orchestrator-service start resume",
-    "services": "pnpm --parallel --filter generator-service --filter scanner-service --filter sync-service start",
+    "services": "pnpm --parallel --filter generator-service --filter scanner-service --filter sync-service --filter db-flush-service start",
     "kill": "pkill -9 -f 'import tsx.*src/service.ts' 2>/dev/null; echo 'service daemons killed'",
-    "up": "pnpm infra:up && pnpm topic:create && pnpm services",
-    "dev": "pnpm --parallel --filter generator-service --filter scanner-service --filter sync-service dev",
+    "up": "pnpm infra:up && pnpm db:setup && pnpm topic:create && pnpm services",
+    "dev": "pnpm --parallel --filter generator-service --filter scanner-service --filter sync-service --filter db-flush-service dev",
     "build": "turbo build",
     "test": "turbo test",
     "type-check": "turbo type-check"
@@ -32,5 +38,13 @@
     "@types/node": "^20.19.43",
     "turbo": "^2",
     "typescript": "^5.6.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma",
+      "esbuild"
+    ]
   }
 }
